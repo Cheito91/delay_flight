@@ -1,0 +1,88 @@
+name: 'Continuous Delivery'
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-test.txt
+        
+    - name: Setup test data
+      run: |
+        mkdir -p ../data
+        cp data/data.csv ../data/data.csv
+        
+    - name: Run tests before deployment
+      run: |
+        pytest tests/model tests/api
+        
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+        
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev
+        
+    - name: Build and Push Docker image
+      run: |
+        IMAGE_NAME="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_REPOSITORY }}/api"
+        gcloud builds submit --tag ${IMAGE_NAME}:${{ github.sha }} --tag ${IMAGE_NAME}:latest
+        
+    - name: Deploy to Cloud Run
+      run: |
+        gcloud run deploy latam-challenge \
+          --image ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_REPOSITORY }}/api:${{ github.sha }} \
+          --platform managed \
+          --region ${{ secrets.GCP_REGION }} \
+          --allow-unauthenticated \
+          --memory 512Mi \
+          --cpu 1 \
+          --port 8080 \
+          --min-instances 0 \
+          --max-instances 10
+          
+    - name: Get Service URL
+      id: get-url
+      run: |
+        SERVICE_URL=$(gcloud run services describe latam-challenge \
+          --platform managed \
+          --region ${{ secrets.GCP_REGION }} \
+          --format 'value(status.url)')
+        echo "url=${SERVICE_URL}" >> $GITHUB_OUTPUT
+        echo " Service deployed at: ${SERVICE_URL}"
+        
+    - name: Run smoke test
+      run: |
+        sleep 10
+        curl -f ${{ steps.get-url.outputs.url }}/health || exit 1
+        echo " Health check passed"
+        
+    - name: Test predict endpoint
+      run: |
+        curl -X POST ${{ steps.get-url.outputs.url }}/predict \
+          -H "Content-Type: application/json" \
+          -d '{"flights":[{"OPERA":"Aerolineas Argentinas","TIPOVUELO":"N","MES":3}]}' \
+          || exit 1
+        echo " Predict endpoint working"
